@@ -254,6 +254,67 @@ export async function POST(request: NextRequest) {
       } catch (e) {
         console.log('In-page API pagination failed:', (e as Error)?.message || e);
       }
+
+      // Step 3a-2: Alternate BoardFeed strategy using /pins/ source_url and larger page_size
+      try {
+        const partsAlt = parseBoardUrl(boardUrl);
+        if (partsAlt?.username && partsAlt?.slug) {
+          const apiPinsRawAlt = await page.evaluate(async (parts: { username: string; slug: string }) => {
+            const collected: any[] = [];
+            let bookmark: string | undefined = undefined;
+            for (let i = 0; i < 30; i++) {
+              const params: any = new URLSearchParams({
+                source_url: `/${parts.username}/${parts.slug}/pins/`,
+                data: JSON.stringify({
+                  options: {
+                    board_url: `/${parts.username}/${parts.slug}/`,
+                    field_set_key: 'react_grid_pin',
+                    filter_section_pins: false,
+                    sort: 'default',
+                    layout: 'default',
+                    page_size: 250,
+                    ...(bookmark ? { bookmarks: [bookmark] } : {})
+                  },
+                  context: {}
+                })
+              });
+              const url = `https://www.pinterest.com/resource/BoardFeedResource/get/?${params.toString()}`;
+              const resp = await fetch(url, {
+                headers: {
+                  'X-Requested-With': 'XMLHttpRequest',
+                  'X-Pinterest-AppState': 'active',
+                  'Accept': 'application/json, text/javascript, */*; q=0.01',
+                  'Referer': `https://www.pinterest.com/${parts.username}/${parts.slug}/pins/`
+                }
+              });
+              if (!resp.ok) break;
+              const data = await resp.json();
+              const results = data?.resource_response?.data?.results || data?.resource_response?.data || [];
+              for (const pin of Array.isArray(results) ? results : []) {
+                collected.push(pin);
+              }
+              bookmark =
+                data?.resource?.options?.bookmarks?.[0] ||
+                data?.resource_response?.bookmark ||
+                data?.resource_response?.data?.bookmark ||
+                data?.bookmark;
+              if (!bookmark) break;
+              await new Promise(r => setTimeout(r, 400 + Math.floor(Math.random() * 300)));
+            }
+            return collected;
+          }, partsAlt);
+
+          for (const pin of apiPinsRawAlt as any[]) {
+            const img = buildImageFromPin(pin);
+            if (img && !networkPins.has(img.id)) {
+              networkPins.set(img.id, img);
+            }
+          }
+          console.log(`🛰️ Alt BoardFeed captured ${networkPins.size} pins so far (cumulative)`);
+        }
+      } catch (e) {
+        console.log('Alt BoardFeed pagination failed:', (e as Error)?.message || e);
+      }
 // Step 3b: Fetch pins from board sections via internal APIs (in-page, with cookies)
 try {
   const parts = parseBoardUrl(boardUrl);
@@ -360,13 +421,26 @@ try {
           'Referer': `https://www.pinterest.com/${parts.username}/${parts.slug}/`
         } as Record<string, string>;
 
-        // Collect pin ids present in the DOM
-        const anchors = Array.from(document.querySelectorAll('a[href*="/pin/"]'));
+        // Collect pin ids present in the DOM (anchors + data attributes)
         const idSet = new Set<string>();
+
+        // Anchors like /pin/123456789012345/
+        const anchors = Array.from(document.querySelectorAll('a[href*="/pin/"]'));
         for (const a of anchors) {
           const href = (a as HTMLAnchorElement).getAttribute('href') || '';
           const m = href.match(/\/pin\/(\d{8,})/);
           if (m && m[1]) idSet.add(m[1]);
+        }
+
+        // Elements that carry pin ids in data attributes
+        const dataIdElems = Array.from(document.querySelectorAll('[data-test-pin-id],[data-test-id],[data-pin-id]'));
+        for (const el of dataIdElems) {
+          const ds: any = (el as HTMLElement).dataset || {};
+          const candidates = [ds.testPinId, ds.pinId, ds.testId].filter(Boolean);
+          for (const c of candidates) {
+            const m = String(c).match(/(\d{8,})/);
+            if (m && m[1]) idSet.add(m[1]);
+          }
         }
 
         // Determine which ids are missing from network-captured pins

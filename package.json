@@ -6,6 +6,9 @@
     "dev": "next dev -p 3017 --turbopack",
     "build": "next build --turbopack",
     "start": "next start -p 3017",
+    "start:dev": "npm run dev",
+    "start:prod": "npm run build && next start -p 3017",
+    "start:clean": "bash -lc 'PIDS=$(lsof -ti tcp:3017 || true); if [ -n \"$PIDS\" ]; then echo \"$PIDS\" | xargs -r kill -9 || true; fi; next dev -p 3017 --turbopack'",
     "lint": "eslint"
   },
   "dependencies": {
