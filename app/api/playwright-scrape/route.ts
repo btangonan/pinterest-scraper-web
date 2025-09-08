@@ -270,11 +270,13 @@ try {
 
       try {
         // Enumerate board sections
+        const boardId = (() => { try { const el = document.querySelector('#__PWS_DATA__'); if (el && el.textContent) { const s = el.textContent; const m = s.match(/"board_id"\s*:\s*"(\d+)"/) || s.match(/"board"\s*:\s*\{[^}]*"id"\s*:\s*"(\d+)"/); return m ? (m[1] || m[2]) : undefined; } } catch {} return undefined; })();
         const secParams: any = new URLSearchParams({
           source_url: `/${parts.username}/${parts.slug}/`,
           data: JSON.stringify({
             options: {
-              board_url: `/${parts.username}/${parts.slug}/`
+              board_url: `/${parts.username}/${parts.slug}/`,
+              ...(boardId ? { board_id: boardId } : {})
             },
             context: {}
           })
@@ -295,6 +297,7 @@ try {
                   data: JSON.stringify({
                     options: {
                       board_url: `/${parts.username}/${parts.slug}/`,
+                      ...(boardId ? { board_id: boardId } : {}),
                       section_id: section.id,
                       field_set_key: 'react_grid_pin',
                       sort: 'default',
@@ -431,6 +434,107 @@ try {
 } catch (e) {
   console.log('PinResource detail fetch failed:', (e as Error)?.message || e);
 }
+      /**
+       * Step 3d: __PWS_DATA__ harvest + PinResource backfill (in-page, with cookies)
+       * Goal: capture any remaining pin IDs present in the bootstrapped JSON and fetch their details.
+       * This runs after sections + DOM anchor crawl so the only remaining are hard-to-reach items.
+       */
+      try {
+        const parts3 = parseBoardUrl(boardUrl);
+        if (parts3?.username && parts3?.slug) {
+          const knownNetworkIds3 = Array.from(networkPins.keys());
+          const pwsBackfillRaw = await page.evaluate(
+            async ({ knownIds, parts }: { knownIds: string[]; parts: { username: string; slug: string } }) => {
+              const headers = {
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-Pinterest-AppState': 'active',
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'Referer': `https://www.pinterest.com/${parts.username}/${parts.slug}/`
+              } as Record<string, string>;
+      
+              const collected: any[] = [];
+              const ids = new Set<string>();
+      
+              try {
+                const el = document.querySelector('#__PWS_DATA__');
+                if (el && el.textContent) {
+                  const data = JSON.parse(el.textContent);
+                  const stack: any[] = [data];
+                  while (stack.length) {
+                    const obj = stack.pop();
+                    if (!obj) continue;
+                    if (Array.isArray(obj)) {
+                      for (const it of obj) stack.push(it);
+                    } else if (typeof obj === 'object') {
+                      if (obj.id && obj.images) {
+                        const idStr = String(obj.id);
+                        ids.add(idStr);
+                      }
+                      for (const v of Object.values(obj)) {
+                        if (v && (typeof v === 'object')) stack.push(v);
+                      }
+                    }
+                  }
+                }
+              } catch {
+                // ignore parse errors
+              }
+      
+              // Fetch details for pin IDs not yet known
+              const toFetch = Array.from(ids).filter(id => !knownIds.includes(id));
+              for (const pinId of toFetch) {
+                try {
+                  const params = new URLSearchParams({
+                    source_url: `/${parts.username}/${parts.slug}/`,
+                    data: JSON.stringify({
+                      options: { id: pinId },
+                      context: {}
+                    })
+                  });
+                  const url = `https://www.pinterest.com/resource/PinResource/get/?${params.toString()}`;
+                  const resp = await fetch(url, { headers });
+                  if (!resp.ok) continue;
+                  const data = await resp.json();
+                  const pin = data?.resource_response?.data;
+                  if (pin && pin.id) {
+                    // Ensure the pin belongs to this board before accepting
+                    try {
+                      const expected = `/${parts.username}/${parts.slug}/`;
+                      const pinBoardUrl: string =
+                        (pin?.board?.url as string) ||
+                        (pin?.board?.url_path as string) || '';
+                      const sameBoard = typeof pinBoardUrl === 'string' && pinBoardUrl.startsWith(expected);
+                      const sameOwner = pin?.board?.owner?.username === parts.username;
+                      if (sameBoard || sameOwner) {
+                        collected.push(pin);
+                      }
+                    } catch {
+                      // skip on structure issues
+                    }
+                  }
+                  await new Promise((res) => setTimeout(res, 200 + Math.floor(Math.random() * 200)));
+                } catch {
+                  // ignore fetch errors per pin
+                }
+                if (collected.length > 400) break; // safety cap
+              }
+              return collected;
+            },
+            { knownIds: knownNetworkIds3, parts: parts3 }
+          );
+      
+          for (const pin of pwsBackfillRaw as any[]) {
+            const img = buildImageFromPin(pin);
+            if (img && !networkPins.has(img.id)) {
+              networkPins.set(img.id, img);
+            }
+          }
+          console.log(`📦 __PWS_DATA__/PinResource backfill added ${Array.isArray(pwsBackfillRaw) ? pwsBackfillRaw.length : 0} pins (cumulative ${networkPins.size})`);
+        }
+      } catch (e) {
+        console.log('__PWS_DATA__ backfill failed:', (e as Error)?.message || e);
+      }
+      
       // Step 4: Harvest all image URLs from DOM (src + srcset)
       harvestedUrls = await page.evaluate(() => {
         const urls = new Set<string>();
