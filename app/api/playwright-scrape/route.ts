@@ -208,10 +208,10 @@ export async function POST(request: NextRequest) {
                   options: {
                     board_url: `/${parts.username}/${parts.slug}/`,
                     field_set_key: 'react_grid_pin',
-                    filter_section_pins: true,
+                    filter_section_pins: false,
                     sort: 'default',
                     layout: 'default',
-                    page_size: 50,
+                    page_size: 250,
                     ...(bookmark ? { bookmarks: [bookmark] } : {})
                   },
                   context: {}
@@ -254,7 +254,170 @@ export async function POST(request: NextRequest) {
       } catch (e) {
         console.log('In-page API pagination failed:', (e as Error)?.message || e);
       }
+// Step 3b: Fetch pins from board sections via internal APIs (in-page, with cookies)
+try {
+  const parts = parseBoardUrl(boardUrl);
+  if (parts?.username && parts?.slug) {
+    const sectionPinsRaw = await page.evaluate(async (parts: { username: string; slug: string }) => {
+      const headers = {
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-Pinterest-AppState': 'active',
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'Referer': `https://www.pinterest.com/${parts.username}/${parts.slug}/`
+      } as Record<string, string>;
 
+      const collected: any[] = [];
+
+      try {
+        // Enumerate board sections
+        const secParams: any = new URLSearchParams({
+          source_url: `/${parts.username}/${parts.slug}/`,
+          data: JSON.stringify({
+            options: {
+              board_url: `/${parts.username}/${parts.slug}/`
+            },
+            context: {}
+          })
+        });
+        const secUrl = `https://www.pinterest.com/resource/BoardSectionsResource/get/?${secParams.toString()}`;
+        const secResp = await fetch(secUrl, { headers });
+        if (secResp.ok) {
+          const secData = await secResp.json();
+          const sections = secData?.resource_response?.data?.sections || secData?.resource_response?.data || [];
+          for (const section of Array.isArray(sections) ? sections : []) {
+            // Try multiple section endpoints to maximize coverage
+            const endpointNames = ['BoardSectionPinsResource', 'BoardSectionFeedResource'];
+            for (const ep of endpointNames) {
+              let bookmark: string | undefined = undefined;
+              for (let i = 0; i < 20; i++) {
+                const p: any = new URLSearchParams({
+                  source_url: `/${parts.username}/${parts.slug}/`,
+                  data: JSON.stringify({
+                    options: {
+                      board_url: `/${parts.username}/${parts.slug}/`,
+                      section_id: section.id,
+                      field_set_key: 'react_grid_pin',
+                      sort: 'default',
+                      layout: 'default',
+                      page_size: 250,
+                      ...(bookmark ? { bookmarks: [bookmark] } : {})
+                    },
+                    context: {}
+                  })
+                });
+                const url = `https://www.pinterest.com/resource/${ep}/get/?${p.toString()}`;
+                const r = await fetch(url, { headers });
+                if (!r.ok) break;
+                const d = await r.json();
+                const results = d?.resource_response?.data?.results || d?.resource_response?.data || [];
+                for (const pin of Array.isArray(results) ? results : []) {
+                  collected.push(pin);
+                }
+                bookmark =
+                  d?.resource?.options?.bookmarks?.[0] ||
+                  d?.resource_response?.bookmark ||
+                  d?.resource_response?.data?.bookmark ||
+                  d?.bookmark;
+                if (!bookmark) break;
+                await new Promise(res => setTimeout(res, 300 + Math.floor(Math.random() * 300)));
+              }
+            }
+          }
+        }
+      } catch {
+        // ignore section enumeration errors
+      }
+
+      return collected;
+    }, parts);
+
+    for (const pin of sectionPinsRaw as any[]) {
+      const img = buildImageFromPin(pin);
+      if (img && !networkPins.has(img.id)) {
+        networkPins.set(img.id, img);
+      }
+    }
+    console.log(`🗂️ Sections API captured ${Array.isArray(sectionPinsRaw) ? sectionPinsRaw.length : 0} pins (cumulative ${networkPins.size})`);
+  }
+} catch (e) {
+  console.log('Sections API scraping failed:', (e as Error)?.message || e);
+}
+
+// Step 3c: Fetch missing pins by DOM-detected pin ids via PinResource (in-page, with cookies)
+try {
+  const parts2 = parseBoardUrl(boardUrl);
+  if (parts2?.username && parts2?.slug) {
+    const knownNetworkIds = Array.from(networkPins.keys());
+    const domDetailPinsRaw = await page.evaluate(
+      async (knownIds: string[], parts: { username: string; slug: string }) => {
+        const headers = {
+          'X-Requested-With': 'XMLHttpRequest',
+          'X-Pinterest-AppState': 'active',
+          'Accept': 'application/json, text/javascript, */*; q=0.01',
+          'Referer': `https://www.pinterest.com/${parts.username}/${parts.slug}/`
+        } as Record<string, string>;
+
+        // Collect pin ids present in the DOM
+        const anchors = Array.from(document.querySelectorAll('a[href*="/pin/"]'));
+        const idSet = new Set<string>();
+        for (const a of anchors) {
+          const href = (a as HTMLAnchorElement).getAttribute('href') || '';
+          const m = href.match(/\/pin\/(\d{8,})/);
+          if (m && m[1]) idSet.add(m[1]);
+        }
+
+        // Determine which ids are missing from network-captured pins
+        const missing = Array.from(idSet).filter(id => !knownIds.includes(id));
+        const collected: any[] = [];
+
+        // Fetch missing pin details via PinResource (throttled)
+        for (const pinId of missing) {
+          try {
+            const params = new URLSearchParams({
+              source_url: `/${parts.username}/${parts.slug}/`,
+              data: JSON.stringify({
+                options: {
+                  id: pinId
+                },
+                context: {}
+              })
+            });
+            const url = `https://www.pinterest.com/resource/PinResource/get/?${params.toString()}`;
+            const resp = await fetch(url, { headers });
+            if (!resp.ok) continue;
+            const data = await resp.json();
+            const pin = data?.resource_response?.data;
+            if (pin && pin.id) {
+              collected.push(pin);
+            }
+            // Small jittered delay to be polite
+            await new Promise(res => setTimeout(res, 250 + Math.floor(Math.random() * 250)));
+          } catch {
+            // ignore individual pin fetch errors
+          }
+          // Safety cap
+          if (collected.length > 300) break;
+        }
+
+        return collected;
+      },
+      knownNetworkIds,
+      parts2
+    );
+
+    for (const pin of domDetailPinsRaw as any[]) {
+      const img = buildImageFromPin(pin);
+      if (img && !networkPins.has(img.id)) {
+        networkPins.set(img.id, img);
+      }
+    }
+    console.log(
+      `🔎 PinResource detail filled ${Array.isArray(domDetailPinsRaw) ? domDetailPinsRaw.length : 0} pins (cumulative ${networkPins.size})`
+    );
+  }
+} catch (e) {
+  console.log('PinResource detail fetch failed:', (e as Error)?.message || e);
+}
       // Step 4: Harvest all image URLs from DOM (src + srcset)
       harvestedUrls = await page.evaluate(() => {
         const urls = new Set<string>();
