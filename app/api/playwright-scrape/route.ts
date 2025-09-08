@@ -349,7 +349,7 @@ try {
   if (parts2?.username && parts2?.slug) {
     const knownNetworkIds = Array.from(networkPins.keys());
     const domDetailPinsRaw = await page.evaluate(
-      async (knownIds: string[], parts: { username: string; slug: string }) => {
+      async ({ knownIds, parts }: { knownIds: string[]; parts: { username: string; slug: string } }) => {
         const headers = {
           'X-Requested-With': 'XMLHttpRequest',
           'X-Pinterest-AppState': 'active',
@@ -388,7 +388,21 @@ try {
             const data = await resp.json();
             const pin = data?.resource_response?.data;
             if (pin && pin.id) {
-              collected.push(pin);
+              // Validate that the pin truly belongs to this board before accepting
+              try {
+                const expected = `/${parts.username}/${parts.slug}/`;
+                const pinBoardUrl: string =
+                  (pin?.board?.url as string) ||
+                  (pin?.board?.url_path as string) ||
+                  '';
+                const sameBoard = typeof pinBoardUrl === 'string' && pinBoardUrl.startsWith(expected);
+                const sameOwner = pin?.board?.owner?.username === parts.username;
+                if (sameBoard || sameOwner) {
+                  collected.push(pin);
+                }
+              } catch {
+                // skip pins with unexpected structure
+              }
             }
             // Small jittered delay to be polite
             await new Promise(res => setTimeout(res, 250 + Math.floor(Math.random() * 250)));
@@ -401,8 +415,7 @@ try {
 
         return collected;
       },
-      knownNetworkIds,
-      parts2
+      { knownIds: knownNetworkIds, parts: parts2 }
     );
 
     for (const pin of domDetailPinsRaw as any[]) {
