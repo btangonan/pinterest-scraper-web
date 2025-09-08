@@ -127,17 +127,30 @@ export async function POST(request: NextRequest) {
       });
       const page = await context.newPage();
 
-      // Capture BoardFeedResource responses to extract pins directly during scrolls
+      // Capture BoardFeed/Section/PinResource responses to extract pins directly during scrolls
       page.on('response', async (res: any) => {
         try {
           const u = res.url();
-          if (u.includes('/resource/BoardFeedResource/get')) {
+          const isBoardFeed = u.includes('/resource/BoardFeedResource/get');
+          const isSectionFeed = u.includes('/resource/BoardSectionFeedResource/get') || u.includes('/resource/BoardSectionPinsResource/get');
+          const isPinResource = u.includes('/resource/PinResource/get');
+          if (isBoardFeed || isSectionFeed || isPinResource) {
             const data = await res.json();
-            const results = data?.resource_response?.data?.results || data?.resource_response?.data || [];
-            for (const pin of Array.isArray(results) ? results : []) {
-              const img = buildImageFromPin(pin);
-              if (img && !networkPins.has(img.id)) {
-                networkPins.set(img.id, img);
+            if (isPinResource) {
+              const pin = data?.resource_response?.data;
+              if (pin) {
+                const img = buildImageFromPin(pin);
+                if (img && !networkPins.has(img.id)) {
+                  networkPins.set(img.id, img);
+                }
+              }
+            } else {
+              const results = data?.resource_response?.data?.results || data?.resource_response?.data || [];
+              for (const pin of Array.isArray(results) ? results : []) {
+                const img = buildImageFromPin(pin);
+                if (img && !networkPins.has(img.id)) {
+                  networkPins.set(img.id, img);
+                }
               }
             }
           }
@@ -149,6 +162,24 @@ export async function POST(request: NextRequest) {
       // Step 1: Navigate to Pinterest board
       await page.goto(boardUrl, { waitUntil: 'networkidle' });
       console.log('✅ Navigated to Pinterest board');
+
+      // Try to determine expected pin count from __PWS_DATA__ to allow early stop
+      let expectedPinCount: number | undefined = await page.evaluate(() => {
+        try {
+          const el = document.querySelector('#__PWS_DATA__');
+          if (el && el.textContent) {
+            const dataText = el.textContent;
+            const m = dataText.match(/"pin_count"\s*:\s*(\d+)/);
+            if (m) return parseInt(m[1], 10);
+          }
+        } catch {}
+        return undefined;
+      });
+      if (expectedPinCount && Number.isFinite(expectedPinCount)) {
+        console.log(`📌 Expected pin count (from __PWS_DATA__): ${expectedPinCount}`);
+      } else {
+        expectedPinCount = undefined;
+      }
 
       // Opportunistically dismiss overlays if present
       try {
@@ -165,33 +196,58 @@ export async function POST(request: NextRequest) {
         }).catch(() => {});
       } catch { /* no-op */ }
 
-      // Step 2: Infinite scroll to load all pins
+      // Step 2: Smart infinite scroll — stop when no new pins or reached expected count
       const maxScrolls = 120;
       let lastHeight = 0;
+      let staleRounds = 0;
+      let prevAnchorCount = 0;
 
       for (let i = 0; i < maxScrolls; i++) {
+        const beforeNetwork = networkPins.size;
+        prevAnchorCount = await page.evaluate(() => document.querySelectorAll('a[href*="/pin/"]').length);
+
         const currentHeight = await page.evaluate(() => {
           window.scrollTo(0, document.body.scrollHeight);
           return document.body.scrollHeight;
         });
 
-        // If no growth in height, wait and recheck once before breaking
+        // Let Pinterest lazy-load between scrolls
+        await page.waitForLoadState('networkidle');
+        await page.waitForTimeout(700);
+
+        const afterNetwork = networkPins.size;
+        const afterAnchorCount = await page.evaluate(() => document.querySelectorAll('a[href*="/pin/"]').length);
+
+        // Early stop: reached expected pin count
+        if (expectedPinCount && afterNetwork >= expectedPinCount) {
+          console.log(`✅ Reached expected count ${expectedPinCount} after ${i + 1} scrolls`);
+          break;
+        }
+
+        // Detect staleness: no new pins and no new anchors on page
+        if (afterNetwork === beforeNetwork && afterAnchorCount === prevAnchorCount) {
+          staleRounds++;
+        } else {
+          staleRounds = 0;
+        }
+        if (staleRounds >= 3) {
+          console.log(`✅ No new pins detected in ${staleRounds} rounds, stopping at scroll ${i + 1}`);
+          break;
+        }
+
+        // Height stop check (end of page)
         if (currentHeight === lastHeight) {
           await page.waitForTimeout(1200);
           const recheck = await page.evaluate(() => document.body.scrollHeight);
           if (recheck === lastHeight) {
-            console.log(`✅ Reached end of content after ${i} scrolls`);
+            console.log(`✅ Reached end of content after ${i + 1} scrolls`);
             break;
           }
         }
 
         lastHeight = currentHeight;
         scrollCount = i + 1;
-
-        // Let Pinterest lazy-load images/content between scrolls
-        await page.waitForLoadState('networkidle');
-        await page.waitForTimeout(700);
-        console.log(`📜 Scroll ${scrollCount}: page height ${currentHeight}px`);
+        console.log(`📜 Scroll ${scrollCount}: page height ${currentHeight}px, pins=${afterNetwork}, anchors=${afterAnchorCount}`);
       }
 
       // Step 3: Use in-page BoardFeedResource pagination to collect pins (with cookies)
