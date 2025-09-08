@@ -43,33 +43,47 @@ export function extractImagesFromHtml(html: string): { images: PinterestImage[],
   const pwsDataMatch = html.match(/<script[^>]*id="__PWS_DATA__"[^>]*>([^<]+)<\/script>/);
   
   if (pwsDataMatch) {
+    const scriptContent = pwsDataMatch[1];
     try {
-      const scriptContent = pwsDataMatch[1];
       // Pinterest JSON is directly in the script
       const data = JSON.parse(scriptContent);
       
       console.log('Successfully parsed __PWS_DATA__');
       
-      // Extract board info from current Pinterest structure
+      // Extract board info from current Pinterest structure (prefer real board id if available)
       boardInfo = extractBoardInfoNew(data);
       console.log('Extracted board info:', boardInfo);
       
-      // Extract pins using comprehensive JSON parsing
-      const boardPins = extractAllPinsFromData(data);
+      // Prefer board-targeted extraction to avoid suggested pins
+      let boardPins: PinterestImage[] = [];
+      if (boardInfo?.id) {
+        boardPins = extractBoardPins(data, boardInfo.id);
+        if (boardPins.length === 0) {
+          // Try alternate structure-aware extraction
+          boardPins = extractBoardPinsNew(data, boardInfo.id);
+        }
+      } else {
+        // If we couldn't determine board id, fall back to structure-aware scan
+        boardPins = extractBoardPinsNew(data);
+      }
+      // As a last resort only, use the comprehensive regex-based extraction
+      if (boardPins.length === 0) {
+        boardPins = extractAllPinsFromData(data);
+      }
       images.push(...boardPins);
       
       console.log(`Found ${images.length} pins from board ${boardInfo?.name || 'unknown'}`);
     } catch (e) {
       console.error('Failed to parse __PWS_DATA__:', e);
-      console.log('Script content sample:', scriptContent.substring(0, 200));
+      console.log('Script content sample:', scriptContent?.substring(0, 200));
     }
   }
   
   // Fallback: Try other script patterns if __PWS_DATA__ fails
   if (images.length === 0) {
     const scriptPatterns = [
-      /__INITIAL_STATE__\s*=\s*({.*?});/s,
-      /\{"componentName":"InitialReduxState".*?({.*?})\]/s
+      /__INITIAL_STATE__\s*=\s*({[\s\S]*?});/,
+      /\{"componentName":"InitialReduxState"[\s\S]*?({[\s\S]*?})\]/
     ];
     
     for (const pattern of scriptPatterns) {
@@ -91,11 +105,13 @@ export function extractImagesFromHtml(html: string): { images: PinterestImage[],
     }
   }
   
-  // Enhanced HTML extraction with debug-analysis based filtering
-  console.log('Performing enhanced extraction with non-pin filtering');
-  
-  const imgPatterns = [
-    // Basic Pinterest image URL patterns
+  // If structured extraction found nothing, fall back to enhanced HTML scan
+  if (images.length === 0) {
+    // Enhanced HTML extraction with debug-analysis based filtering
+    console.log('Performing enhanced extraction with non-pin filtering');
+    
+    const imgPatterns = [
+      // Basic Pinterest image URL patterns
     /"(https:\/\/i\.pinimg\.com\/[^"]+)"/g,
     /src="(https:\/\/i\.pinimg\.com\/[^"]+)"/g,
     /data-src="(https:\/\/i\.pinimg\.com\/[^"]+)"/g,
@@ -134,20 +150,36 @@ export function extractImagesFromHtml(html: string): { images: PinterestImage[],
     while ((match = pattern.exec(html)) !== null) {
       const imageUrl = match[1];
       
-      // Skip obvious non-pin content  
-      if (imageUrl.includes('/user/') || 
-          imageUrl.includes('/avatars/') || 
-          imageUrl.includes('/static/') ||
-          imageUrl.includes('/boards/') ||
-          imageUrl.includes('/closeup/')) continue;
+      // Skip obvious non-pin content
+      if (
+        imageUrl.includes('/user/') ||
+        imageUrl.includes('/avatars/') ||
+        imageUrl.includes('/static/') ||
+        imageUrl.includes('/boards/') ||
+        imageUrl.includes('/closeup/') ||
+        imageUrl.endsWith('.gif') ||
+        imageUrl.endsWith('.mp4') ||
+        imageUrl.endsWith('.webm')
+      ) continue;
       
       // Extract dimensions and image hash for analysis
       const dimensionMatch = imageUrl.match(/\/(\d+x|\w+)\//);
       if (!dimensionMatch) continue;
       
       const dimension = dimensionMatch[1];
+      // Strictly allow only known pin dimensions to reduce UI/asset noise
+      // Exclude 170x here to avoid suggested/search previews bleeding in
+      const allowedDimensions = new Set(['236x', '474x', '564x', '736x', 'originals']);
+      if (!allowedDimensions.has(dimension)) {
+        console.log(`Filtered non-pin dimension: ${dimension}`);
+        continue;
+      }
+
       const imagePath = imageUrl.split('/').slice(-1)[0];
       const imageHash = imagePath.split('.')[0];
+      
+      // Ensure filename looks like a pin hash (reduce UI/asset noise)
+      if (!/^[0-9a-f]{16,}$/i.test(imageHash)) continue;
       
       // Skip duplicates (same image in different sizes)
       if (seenImageHashes.has(imageHash)) continue;
@@ -169,19 +201,12 @@ export function extractImagesFromHtml(html: string): { images: PinterestImage[],
         continue;
       }
       
-      // 3. Prioritize actual pin dimensions (170x, 236x, 474x from JSON data)
-      const isPriorityDimension = dimension === '170x' || dimension === '236x' || dimension === '474x';
-      
-      // 4. Always include 170x images (JSON pin previews) regardless of other filters
-      const isJsonPin = dimension === '170x';
+      // 3. Prioritize actual pin dimensions (236x, 474x, 564x, 736x)
+      const isPriorityDimension = dimension === '236x' || dimension === '474x' || dimension === '564x' || dimension === '736x';
       
       seenImageHashes.add(imageHash);
       
-      // Stop at reasonable limit to avoid over-extraction
-      if (images.length >= 85) {
-        console.log('Reached extraction limit');
-        break;
-      }
+      // Removed artificial extraction limit to allow full capture of board pins
       
       // Create image object with proper thumbnail URL
       const thumbnailUrl = transformImageUrl(imageUrl, '236x');
@@ -205,6 +230,7 @@ export function extractImagesFromHtml(html: string): { images: PinterestImage[],
   
   console.log(`Enhanced extraction: ${totalFound} total references → ${images.length} filtered pins (targeting 82)`);
   
+  }
   return { images, boardInfo };
 }
 
@@ -408,6 +434,10 @@ function getNestedProperty(obj: any, path: string): any {
  */
 function extractBoardInfoNew(data: any): BoardInfo | undefined {
   try {
+    // Prefer precise board info via recursive search if available
+    const direct = findBoardInfoRecursive(data);
+    if (direct) return direct;
+    
     // Search for board name and pin count anywhere in the data using string matching
     let boardName: string | undefined;
     let pinCount: number | undefined;
@@ -559,6 +589,9 @@ function findPinsInStructure(obj: any, images: PinterestImage[], processedIds: S
   if (obj.id && obj.images && !processedIds.has(obj.id)) {
     // Skip related/suggested content
     if (obj.section_type === 'related' || obj.type === 'story') return;
+
+    // If a boardId is provided, ensure the pin belongs to that board
+    if (boardId && obj.board?.id && obj.board.id !== boardId) return;
     
     processedIds.add(obj.id);
     const image = extractImageFromPin(obj);
@@ -661,22 +694,39 @@ function extractAllPinsFromData(data: any): PinterestImage[] {
  * Extract board username and slug from URL
  */
 export function parseBoardUrl(boardUrl: string): { username: string; slug: string } | null {
-  const patterns = [
-    /pinterest\.com\/([^/]+)\/([^/]+)\/?/,
-    /pin\.it\/([^/]+)\/([^/]+)\/?/
-  ];
-  
-  for (const pattern of patterns) {
-    const match = boardUrl.match(pattern);
-    if (match) {
-      return {
-        username: match[1],
-        slug: match[2]
-      };
+  try {
+    const url = new URL(boardUrl.startsWith('http') ? boardUrl : `https://${boardUrl}`);
+    if (!url.hostname.endsWith('pinterest.com')) return null;
+
+    // Normalize leading/trailing slashes and handle variants like /{user}/{board}/pins
+    const pathname = url.pathname.replace(/^\/+|\/+$/g, '');
+    const parts = pathname.split('/').filter(Boolean);
+
+    // Supported patterns:
+    // /{user}/{board}
+    // /{user}/{board}/pins
+    // /{user}/{board}/pins/...
+    if (parts.length >= 2) {
+      const username = parts[0];
+      const slug = parts[1];
+      return { username, slug };
     }
+
+    return null;
+  } catch {
+    // Fallback regex-based parsing
+    const patterns = [
+      /pinterest\.com\/([^/]+)\/([^/]+)\/?/,
+      /m\.pinterest\.com\/([^/]+)\/([^/]+)\/?/
+    ];
+    for (const pattern of patterns) {
+      const match = boardUrl.match(pattern);
+      if (match) {
+        return { username: match[1], slug: match[2] };
+      }
+    }
+    return null;
   }
-  
-  return null;
 }
 
 /**
@@ -690,45 +740,46 @@ export async function fetchBoardPins(
   const pins: PinterestImage[] = [];
   let boardInfo: BoardInfo | undefined;
   let nextBookmark: string | undefined;
-  
+
   try {
-    // Pinterest's internal API endpoint for board feed
     const apiUrl = 'https://www.pinterest.com/resource/BoardFeedResource/get/';
-    
+
     const options = {
       source_url: `/${username}/${slug}/`,
       data: JSON.stringify({
         options: {
-          board_id: null,
           board_url: `/${username}/${slug}/`,
           field_set_key: 'react_grid_pin',
           filter_section_pins: true,
           sort: 'default',
           layout: 'default',
-          page_size: 25,
-          ...(bookmark && { bookmarks: [bookmark] })
+          page_size: 50,
+          ...(bookmark ? { bookmarks: [bookmark] } : {})
         },
         context: {}
       })
-    };
-    
+    } as Record<string, string>;
+
     const params = new URLSearchParams(options);
-    const response = await fetch(`${apiUrl}?${params}`, {
+    const url = `${apiUrl}?${params.toString()}`;
+
+    const response = await fetch(url, {
       headers: {
-        'Accept': 'application/json, text/javascript, */*, q=0.01',
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'X-Requested-With': 'XMLHttpRequest',
         'X-Pinterest-AppState': 'active',
+        'Referer': `https://www.pinterest.com/${username}/${slug}/`
       }
     });
-    
+
     if (!response.ok) {
-      console.log('API request failed, falling back to HTML scraping');
+      console.log(`API request failed: ${response.status} ${response.statusText}`);
       return { pins: [] };
     }
-    
+
     const data = await response.json();
-    
+
     // Extract board info if available
     if (data.resource_response?.data?.board) {
       const board = data.resource_response.data.board;
@@ -740,23 +791,29 @@ export async function fetchBoardPins(
         owner: board.owner?.username || username
       };
     }
-    
+
     // Extract pins
-    const apiPins = data.resource_response?.data?.results || [];
+    const apiPins = data.resource_response?.data?.results || data.resource_response?.data || [];
     for (const pin of apiPins) {
-      if (!pin.id || !pin.images) continue;
-      
+      if (!pin || !pin.id || !pin.images) continue;
       const image = extractImageFromPin(pin);
       if (image) {
         pins.push(image);
       }
     }
-    
-    // Get next bookmark for pagination
-    nextBookmark = data.resource?.options?.bookmarks?.[0];
-    
+
+    // Robust bookmark extraction for pagination
+    nextBookmark =
+      data.resource?.options?.bookmarks?.[0] ||
+      data.resource_response?.bookmark ||
+      data.resource_response?.data?.bookmark ||
+      data.bookmark ||
+      undefined;
+
+    // Small randomized delay to respect rate limits
+    await new Promise((resolve) => setTimeout(resolve, 300 + Math.floor(Math.random() * 500)));
+
     return { pins, nextBookmark, boardInfo };
-    
   } catch (error) {
     console.error('Error fetching from Pinterest API:', error);
     return { pins: [] };
@@ -770,9 +827,10 @@ export async function scrapePinterestBoard(
   boardUrl: string,
   maxPages: number = 10
 ): Promise<{ images: PinterestImage[], boardInfo?: BoardInfo }> {
-  const allImages: PinterestImage[] = [];
+  let allImages: PinterestImage[] = [];
   let boardInfo: BoardInfo | undefined;
-  
+  const seenIds = new Set<string>();
+
   // First, try HTML scraping for initial pins
   console.log('Fetching initial board page...');
   const response = await fetch(boardUrl, {
@@ -781,72 +839,86 @@ export async function scrapePinterestBoard(
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     }
   });
-  
+
   if (!response.ok) {
     throw new Error(`Failed to fetch board: ${response.status}`);
   }
-  
+
   const html = await response.text();
   const { images: initialImages, boardInfo: htmlBoardInfo } = extractImagesFromHtml(html);
-  
-  allImages.push(...initialImages);
+
+  // De-duplicate initial pins
+  for (const img of initialImages) {
+    if (!seenIds.has(img.id)) {
+      seenIds.add(img.id);
+      allImages.push(img);
+    }
+  }
   boardInfo = htmlBoardInfo;
-  
+
   // Parse board URL for API calls
   const boardParts = parseBoardUrl(boardUrl);
   if (!boardParts) {
     console.log('Could not parse board URL for pagination');
     return { images: allImages, boardInfo };
   }
-  
-  // Always try to fetch more pages via Pinterest API (we know there are 82 pins total)
-  const expectedTotalPins = 82; // Known from debug output
-  console.log(`Attempting to fetch more pins via Pinterest API. Current: ${allImages.length}, Expected: ${expectedTotalPins}`);
-    
-    let bookmark: string | undefined;
-    let pagesLoaded = 1;
-    const seenIds = new Set(allImages.map(img => img.id));
-    
-    // Try to fetch additional pages
-    while (pagesLoaded < maxPages) {
-      const { pins: newPins, nextBookmark, boardInfo: apiBoardInfo } = await fetchBoardPins(
-        boardParts.username,
-        boardParts.slug,
-        bookmark
-      );
-      
-      if (!boardInfo && apiBoardInfo) {
-        boardInfo = apiBoardInfo;
-      }
-      
-      // Add only new pins
-      let newPinsAdded = 0;
-      for (const pin of newPins) {
-        if (!seenIds.has(pin.id)) {
-          seenIds.add(pin.id);
-          allImages.push(pin);
-          newPinsAdded++;
-        }
-      }
-      
-      console.log(`Page ${pagesLoaded}: Added ${newPinsAdded} new pins (total: ${allImages.length})`);
-      
-      // Stop if no new pins or no next bookmark
-      if (newPinsAdded === 0 || !nextBookmark) {
-        break;
-      }
-      
-      bookmark = nextBookmark;
-      pagesLoaded++;
-      
-      // Stop if we've likely fetched most pins
-      if (allImages.length >= expectedTotalPins * 0.9) {
-        console.log('Fetched most available pins');
-        break;
+
+  const expectedTotalPins = boardInfo?.pinCount && Number.isFinite(boardInfo.pinCount)
+    ? boardInfo.pinCount
+    : 1000; // upper bound safety, will stop earlier based on bookmark/no-new-pins
+
+  console.log(`Attempting to fetch more pins via Pinterest API. Current: ${allImages.length}, Expected (if known): ${boardInfo?.pinCount ?? 'unknown'}`);
+
+  let bookmark: string | undefined;
+  let pagesLoaded = 0;
+
+  // Fetch additional pages until no bookmark/no new pins or maxPages reached
+  while (pagesLoaded < maxPages) {
+    const { pins: newPins, nextBookmark, boardInfo: apiBoardInfo } = await fetchBoardPins(
+      boardParts.username,
+      boardParts.slug,
+      bookmark
+    );
+
+    if (!boardInfo && apiBoardInfo) {
+      boardInfo = apiBoardInfo;
+    }
+
+    // Add only new pins
+    let addedThisPage = 0;
+    for (const pin of newPins) {
+      if (!seenIds.has(pin.id)) {
+        seenIds.add(pin.id);
+        allImages.push(pin);
+        addedThisPage++;
       }
     }
-  
-  // Update board info with actual results
+
+    pagesLoaded++;
+    console.log(`Page ${pagesLoaded}: Added ${addedThisPage} new pins (total: ${allImages.length})`);
+
+    // Stop if no new pins or no next bookmark
+    if (addedThisPage === 0 || !nextBookmark) {
+      break;
+    }
+
+    bookmark = nextBookmark;
+
+    // Stop once we reach the known total pin count
+    if (boardInfo?.pinCount && allImages.length >= boardInfo.pinCount) {
+      break;
+    }
+
+    // Safety stop
+    if (allImages.length >= expectedTotalPins) {
+      break;
+    }
+
+    // Small randomized delay to respect rate limits
+    await new Promise((resolve) => setTimeout(resolve, 300 + Math.floor(Math.random() * 500)));
+  }
+
+  // Update board info with actual results if still missing
   if (!boardInfo && allImages.length > 0) {
     boardInfo = {
       id: generateBoardId('moodboard'),
@@ -856,7 +928,14 @@ export async function scrapePinterestBoard(
       owner: boardParts.username
     };
   }
-  
+
+  // Confirmation check only (no clamping)
+  if (boardInfo?.pinCount && Number.isFinite(boardInfo.pinCount)) {
+    if (allImages.length !== boardInfo.pinCount) {
+      console.log(`Pin count mismatch (reported ${boardInfo.pinCount} vs scraped ${allImages.length})`);
+    }
+  }
+
   console.log(`Total pins scraped: ${allImages.length}`);
   return { images: allImages, boardInfo };
 }

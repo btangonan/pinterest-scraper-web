@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
 import type { PinterestImage } from '@/lib/scraper';
@@ -14,33 +14,61 @@ export default function Home() {
   const [successMsg, setSuccessMsg] = useState('');
   const [selectedImages, setSelectedImages] = useState<Set<string>>(new Set());
   const [imageSize, setImageSize] = useState<'medium' | 'large' | 'original'>('large');
+  const [isPreviewOpen, setIsPreviewOpen] = useState(false);
+  const [previewIndex, setPreviewIndex] = useState<number | null>(null);
 
   const handleScrape = async () => {
     if (!boardUrl) return;
-    
+
     setLoading(true);
     setError('');
     setSuccessMsg('');
     setImages([]);
     setSelectedImages(new Set());
-    
-    try {
-      const response = await fetch('/api/scrape', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ boardUrl })
-      });
-      
-      const data = await response.json();
-      
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to scrape board');
+
+    const postJson = async (url: string, body: any, timeoutMs = 20000) => {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: controller.signal
+        });
+        const data = await res.json().catch(() => ({}));
+        return { ok: res.ok, data };
+      } catch (e) {
+        return { ok: false, data: { error: e instanceof Error ? e.message : 'Request failed' } };
+      } finally {
+        clearTimeout(t);
       }
-      
-      setImages(data.images);
+    };
+
+    try {
+      // 1) Try Playwright first for complete pin coverage (browser automation + DOM harvest + in-page API)
+      // Increase timeout because browser automation can exceed 20s
+      let resp = await postJson('/api/playwright-scrape', { boardUrl }, 90000);
+
+      // 2) Fallback to server scrape if Playwright fails or returns nothing
+      if (!resp.ok || !resp.data?.images?.length) {
+        resp = await postJson('/api/scrape', { boardUrl, maxPages: 20 });
+      }
+
+      // 3) Last resort: enhanced static scrape (multi-UA HTML sweep)
+      if (!resp.ok || !resp.data?.images?.length) {
+        resp = await postJson('/api/enhanced-scrape', { boardUrl });
+      }
+
+      if (!resp.ok) {
+        throw new Error(resp.data?.error || 'Failed to scrape board');
+      }
+
+      const resultImages: PinterestImage[] = resp.data.images || [];
+      setImages(resultImages);
       // Auto-select all images initially
-      setSelectedImages(new Set(data.images.map((img: PinterestImage) => img.id)));
-      
+      setSelectedImages(new Set(resultImages.map((img: PinterestImage) => img.id)));
+      setSuccessMsg(resp.data?.message || `Fetched ${resultImages.length} images`);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
@@ -57,6 +85,38 @@ export default function Home() {
     }
     setSelectedImages(newSelection);
   };
+
+  // Preview controls
+  const openPreview = (index: number) => {
+    setIsPreviewOpen(true);
+    setPreviewIndex(index);
+  };
+
+  const closePreview = () => {
+    setIsPreviewOpen(false);
+    setPreviewIndex(null);
+  };
+
+  const goPrev = () => {
+    if (!images.length || previewIndex === null) return;
+    setPreviewIndex((previewIndex + images.length - 1) % images.length);
+  };
+
+  const goNext = () => {
+    if (!images.length || previewIndex === null) return;
+    setPreviewIndex((previewIndex + 1) % images.length);
+  };
+
+  useEffect(() => {
+    if (!isPreviewOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') closePreview();
+      if (e.key === 'ArrowLeft') goPrev();
+      if (e.key === 'ArrowRight') goNext();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isPreviewOpen, previewIndex, images.length]);
 
   const selectAll = () => {
     setSelectedImages(new Set(images.map(img => img.id)));
@@ -245,54 +305,68 @@ export default function Home() {
 
             {/* Image Grid */}
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
-              {images.map((image) => (
+              {images.map((image, idx) => (
                 <div
                   key={image.id}
                   className={`relative group cursor-pointer rounded-lg overflow-hidden shadow-md transition-all ${
-                    selectedImages.has(image.id) 
-                      ? 'ring-4 ring-blue-500 scale-95' 
-                      : 'hover:scale-105'
+                    selectedImages.has(image.id)
+                      ? 'ring-2 ring-blue-500'
+                      : 'hover:shadow-lg'
                   }`}
                   onClick={() => toggleImageSelection(image.id)}
+                  onDoubleClick={(e) => { e.stopPropagation(); openPreview(idx); }}
                 >
-                  <img
-                    src={image.thumbnail}
-                    alt={image.title || 'Pinterest Image'}
-                    className="w-full h-auto bg-gray-100"
-                    loading="lazy"
-                    crossOrigin="anonymous"
-                    onError={(e) => {
-                      // Multiple fallback attempts
-                      const target = e.target as HTMLImageElement;
-                      const currentSrc = target.src;
-                      
-                      if (currentSrc === image.thumbnail) {
-                        // Try proxy if direct URL failed
-                        target.src = `/api/download?url=${encodeURIComponent(image.thumbnail)}`;
-                      } else if (currentSrc.includes('/api/download')) {
-                        // Try different size if proxy failed
-                        target.src = image.medium;
-                      } else {
-                        // Last resort: try original
-                        target.src = image.original;
-                      }
-                      
-                      // Add error styling
-                      target.style.backgroundColor = '#f3f4f6';
-                      target.style.border = '2px dashed #d1d5db';
-                    }}
-                  />
+                  <div className="w-full h-64 bg-gray-100">
+                    <img
+                      src={`/api/download?url=${encodeURIComponent(image.thumbnail)}`}
+                      alt={image.title || 'Pinterest Image'}
+                      className="w-full h-full object-cover object-center"
+                      loading="lazy"
+                      crossOrigin="anonymous"
+                      onError={(e) => {
+                        // Multiple fallback attempts (always via proxy to avoid CORS)
+                        const target = e.target as HTMLImageElement;
+                        const currentSrc = target.src;
+
+                        const proxied = (u: string) => `/api/download?url=${encodeURIComponent(u)}`;
+
+                        // Attempt cascade across sizes
+                        if (currentSrc.includes(encodeURIComponent(image.thumbnail))) {
+                          // Try different size if thumbnail failed
+                          target.src = proxied(image.medium);
+                        } else if (currentSrc.includes(encodeURIComponent(image.medium))) {
+                          // Last resort: try original
+                          target.src = proxied(image.original);
+                        } else {
+                          // As a final fallback, attempt swapping extension to .jpg across sizes
+                          const toJpg = (u: string) => u.replace(/\.(png|webp|jpeg)$/i, '.jpg');
+                          const jpgCandidates = [image.original, image.large, image.medium, image.thumbnail]
+                            .filter(Boolean)
+                            .map(u => toJpg(u as string));
+
+                          for (const u of jpgCandidates) {
+                            if (!currentSrc.includes(encodeURIComponent(u))) {
+                              target.src = proxied(u);
+                              break;
+                            }
+                          }
+                        }
+
+                        // Add error styling
+                        target.style.backgroundColor = '#f3f4f6';
+                        target.style.border = '2px dashed #d1d5db';
+                      }}
+                    />
+                  </div>
                   
-                  {/* Selection Overlay */}
-                  <div className={`absolute inset-0 flex items-center justify-center transition-opacity ${
-                    selectedImages.has(image.id)
-                      ? 'bg-blue-500 bg-opacity-30'
-                      : 'bg-black bg-opacity-0 group-hover:bg-opacity-20'
-                  }`}>
+                  {/* Selection Indicator */}
+                  <div className="absolute inset-0 pointer-events-none">
                     {selectedImages.has(image.id) && (
-                      <svg className="w-12 h-12 text-white drop-shadow-lg" fill="currentColor" viewBox="0 0 20 20">
-                        <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
-                      </svg>
+                      <div className="absolute top-2 left-2 bg-white/95 rounded-full p-1 shadow">
+                        <svg className="w-5 h-5 text-blue-600" fill="currentColor" viewBox="0 0 20 20">
+                          <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
+                        </svg>
+                      </div>
                     )}
                   </div>
                   
@@ -306,6 +380,95 @@ export default function Home() {
               ))}
             </div>
           </>
+        )}
+
+        {/* Image Preview Modal */}
+        {isPreviewOpen && previewIndex !== null && images[previewIndex] && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center">
+            <div className="absolute inset-0 bg-black/70" onClick={closePreview} />
+            <div className="relative z-10 max-w-5xl w-[90%] max-h-[90vh] bg-white rounded-lg shadow-xl overflow-hidden">
+              <div className="flex items-center justify-between p-3 border-b border-gray-200">
+                <div className="text-sm text-gray-700">
+                  Preview {previewIndex + 1} / {images.length}
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    className="px-3 py-1 rounded bg-gray-100 hover:bg-gray-200 text-gray-800 text-sm"
+                    onClick={() => {
+                      const id = images[previewIndex].id;
+                      toggleImageSelection(id);
+                    }}
+                  >
+                    {selectedImages.has(images[previewIndex].id) ? 'Deselect' : 'Select'}
+                  </button>
+                  <button
+                    className="p-2 rounded hover:bg-gray-100 text-gray-800"
+                    onClick={closePreview}
+                    aria-label="Close preview"
+                  >
+                    <span className="text-xl">×</span>
+                  </button>
+                </div>
+              </div>
+
+              <div className="relative bg-black flex items-center justify-center" style={{ maxHeight: 'calc(90vh - 48px)' }}>
+                <button
+                  className="absolute left-2 top-1/2 -translate-y-1/2 p-2 rounded-full bg-white/80 hover:bg-white text-gray-900"
+                  onClick={(e) => { e.stopPropagation(); goPrev(); }}
+                  aria-label="Previous image"
+                >
+                  ‹
+                </button>
+
+                <img
+                  src={`/api/download?url=${encodeURIComponent(images[previewIndex].large || images[previewIndex].medium || images[previewIndex].original)}`}
+                  alt={images[previewIndex].title || 'Preview'}
+                  className="max-h-[calc(90vh-48px)] w-auto object-contain"
+                  onError={(e) => {
+                    const img = e.target as HTMLImageElement;
+                    const current = images[previewIndex!];
+                    const proxied = (u: string) => `/api/download?url=${encodeURIComponent(u)}`;
+
+                    // Try alternate sizes first
+                    const sizeCandidates = [current.medium, current.original].filter(Boolean) as string[];
+                    for (const u of sizeCandidates) {
+                      if (!img.src.includes(encodeURIComponent(u))) {
+                        img.src = proxied(u);
+                        return;
+                      }
+                    }
+
+                    // As a final fallback, try swapping extension to .jpg across sizes
+                    const toJpg = (u: string) => u.replace(/\.(png|webp|jpeg)$/i, '.jpg');
+                    const jpgCandidates = [current.original, current.large, current.medium, current.thumbnail]
+                      .filter(Boolean)
+                      .map(u => toJpg(u as string));
+
+                    for (const u of jpgCandidates) {
+                      if (!img.src.includes(encodeURIComponent(u))) {
+                        img.src = proxied(u);
+                        return;
+                      }
+                    }
+                  }}
+                />
+
+                <button
+                  className="absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-full bg-white/80 hover:bg-white text-gray-900"
+                  onClick={(e) => { e.stopPropagation(); goNext(); }}
+                  aria-label="Next image"
+                >
+                  ›
+                </button>
+              </div>
+
+              {images[previewIndex].title && (
+                <div className="p-3 border-t border-gray-200 text-sm text-gray-700">
+                  {images[previewIndex].title}
+                </div>
+              )}
+            </div>
+          </div>
         )}
 
         {/* Loading State */}

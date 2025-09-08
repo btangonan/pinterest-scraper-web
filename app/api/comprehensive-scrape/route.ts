@@ -51,14 +51,13 @@ export async function POST(request: NextRequest) {
       
       if (response.ok) {
         const html = await response.text();
-        const { images, debugInfo } = extractImagesFromHtml(html);
+        const { images } = extractImagesFromHtml(html);
         
         const strategyResult = {
           name: 'Current Enhanced Scraping',
           success: true,
           pinCount: images.length,
           images,
-          debugInfo,
           uniqueToStrategy: 0
         };
         
@@ -127,12 +126,12 @@ export async function POST(request: NextRequest) {
             const id = url.split('/').pop()?.split('.')[0] || Math.random().toString();
             rssImages.push({
               id,
+              url,
               thumbnail: url,
               medium: url,
+              large: url,
               original: url,
-              title: 'RSS Pin',
-              url: boardUrl,
-              boardName: 'moodboard'
+              title: 'RSS Pin'
             });
           }
         }
@@ -247,7 +246,7 @@ export async function POST(request: NextRequest) {
         boardUrl.replace('pinterest.com', 'pinterest.com') + '?show=all'
       ];
       
-      let bestAltResult = { pinCount: 0, images: [], url: '', uniqueToStrategy: 0 };
+      let bestAltResult: { pinCount: number; images: PinterestImage[]; url: string; uniqueToStrategy: number } = { pinCount: 0, images: [], url: '', uniqueToStrategy: 0 };
       
       for (const altUrl of altUrls) {
         try {
